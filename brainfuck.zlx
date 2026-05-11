@@ -1,0 +1,27 @@
+.{
+    .name = "brainfuck",
+    .version = "0.1.0",
+    .format_version = 1,
+    .api_min = 1,
+    .api_max = 1,
+    .targets = .{ "linux-x86_64" },
+    .dependencies = .{},
+    .modules = .{},
+    .syntax_blocks = .{
+        .{ .name = "brainfuck", .delimiter_mode = .brace_counting, .mandatory = true },
+    },
+    .cli_flags = .{
+        .{ .name = "-b", .mandatory = false },
+        .{ .name = "-b8", .mandatory = false },
+        .{ .name = "-b16", .mandatory = false },
+        .{ .name = "-b32", .mandatory = false },
+        .{ .name = "-b64", .mandatory = false },
+    },
+    .native_libs = .{},
+    .link_flags = .{},
+    .expose = .{
+        .global_syntax = true,
+        .global_modules = false,
+    },
+    .entry = "brainfuck.so",
+}
