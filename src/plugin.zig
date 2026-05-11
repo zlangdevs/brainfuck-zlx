@@ -35,7 +35,7 @@ var probe_singleton: ProbeResult = .{
     .api_min = 1,
     .api_max = 1,
     .name = "brainfuck",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .requires_host_features = null,
 };
 
@@ -43,46 +43,312 @@ var desc_singleton: PluginDesc = .{
     .api_min = 1,
     .api_max = 1,
     .name = "brainfuck",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .register_plugin = registerPlugin,
 };
 
+const alloc = std.heap.c_allocator;
 var output_buf: std.ArrayList(u8) = .empty;
-const buf_alloc = std.heap.c_allocator;
+var block_counter: u32 = 0;
 
-const prelude: []const u8 =
-    \\arr<u8, 30000> __bf_tape;
-    \\for i32 __bf_i = 0; __bf_i < 30000; __bf_i++ { __bf_tape[__bf_i] = 0; }
-    \\i32 __bf_p = 0;
-    \\
-;
+const LoadRequest = struct {
+    var_name: []u8,
+    pos: i32,
+};
 
-const postlude: []const u8 = "";
+const BfCtx = struct {
+    cell_size: i32 = 8,
+    len: i32 = 100,
+    code: std.ArrayList(u8) = .empty,
+    loads: std.ArrayList(LoadRequest) = .empty,
 
-fn emit(s: []const u8) void {
-    output_buf.appendSlice(buf_alloc, s) catch {};
+    fn deinit(self: *BfCtx) void {
+        self.code.deinit(alloc);
+        for (self.loads.items) |l| alloc.free(l.var_name);
+        self.loads.deinit(alloc);
+    }
+};
+
+fn parseConfig(input: []const u8) !BfCtx {
+    var ctx: BfCtx = .{};
+    errdefer ctx.deinit();
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '?') {
+            const close = std.mem.indexOfScalarPos(u8, input, i + 1, '?') orelse break;
+            const inner = std.mem.trim(u8, input[i + 1 .. close], " \t");
+            i = close + 1;
+            const space = std.mem.indexOfAny(u8, inner, " \t");
+            if (space) |sp| {
+                const name = inner[0..sp];
+                const value = std.mem.trim(u8, inner[sp + 1 ..], " \t");
+                if (std.mem.eql(u8, name, "cell_size")) {
+                    ctx.cell_size = std.fmt.parseInt(i32, value, 10) catch ctx.cell_size;
+                } else if (std.mem.eql(u8, name, "len")) {
+                    ctx.len = std.fmt.parseInt(i32, value, 10) catch ctx.len;
+                } else if (std.mem.eql(u8, name, "load")) {
+                    var parts = std.mem.splitScalar(u8, value, ' ');
+                    const var_name = parts.next() orelse continue;
+                    const pos_str = parts.next() orelse continue;
+                    const pos = std.fmt.parseInt(i32, std.mem.trim(u8, pos_str, " \t"), 10) catch continue;
+                    const name_dup = try alloc.dupe(u8, std.mem.trim(u8, var_name, " \t"));
+                    try ctx.loads.append(alloc, .{ .var_name = name_dup, .pos = pos });
+                }
+            }
+            continue;
+        }
+        const ch = input[i];
+        i += 1;
+        switch (ch) {
+            '+', '-', '<', '>', '.', ',', '[', ']' => try ctx.code.append(alloc, ch),
+            else => {},
+        }
+    }
+    return ctx;
 }
 
-fn translate(code: []const u8) void {
-    output_buf.clearRetainingCapacity();
-    emit(prelude);
-    for (code) |ch| switch (ch) {
-        '+' => emit("__bf_tape[__bf_p] = __bf_tape[__bf_p] + 1;\n"),
-        '-' => emit("__bf_tape[__bf_p] = __bf_tape[__bf_p] - 1;\n"),
-        '>' => emit("__bf_p = __bf_p + 1;\n"),
-        '<' => emit("__bf_p = __bf_p - 1;\n"),
-        '.' => emit("@printf(\"%c\", __bf_tape[__bf_p]);\n"),
-        '[' => emit("for { if (__bf_tape[__bf_p] == 0) { break; }\n"),
-        ']' => emit("}\n"),
+const BfOp = union(enum) {
+    inc_ptr: i32,
+    add_val: i32,
+    output,
+    input,
+    loop_start,
+    loop_end,
+    set_zero,
+    linear_loop: std.ArrayList(LinearOp),
+    scan_left,
+    scan_right,
+};
+
+const LinearOp = struct { offset: i32, factor: i32 };
+
+fn freeOps(ops: []const BfOp) void {
+    for (ops) |op| switch (op) {
+        .linear_loop => |list| {
+            var m = list;
+            m.deinit(alloc);
+        },
         else => {},
     };
-    emit(postlude);
+}
+
+fn parseOps(code: []const u8) !std.ArrayList(BfOp) {
+    var ops: std.ArrayList(BfOp) = .empty;
+    for (code) |ch| switch (ch) {
+        '>' => try ops.append(alloc, .{ .inc_ptr = 1 }),
+        '<' => try ops.append(alloc, .{ .inc_ptr = -1 }),
+        '+' => try ops.append(alloc, .{ .add_val = 1 }),
+        '-' => try ops.append(alloc, .{ .add_val = -1 }),
+        '.' => try ops.append(alloc, .output),
+        ',' => try ops.append(alloc, .input),
+        '[' => try ops.append(alloc, .loop_start),
+        ']' => try ops.append(alloc, .loop_end),
+        else => {},
+    };
+    return ops;
+}
+
+fn checkLinearLoop(body: []const BfOp) !?std.ArrayList(LinearOp) {
+    var effects = std.AutoHashMap(i32, i32).init(alloc);
+    defer effects.deinit();
+    var off: i32 = 0;
+    for (body) |op| switch (op) {
+        .inc_ptr => |v| off += v,
+        .add_val => |v| {
+            const entry = try effects.getOrPut(off);
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += v;
+        },
+        else => return null,
+    };
+    if (off != 0) return null;
+    const start = effects.get(0) orelse return null;
+    if (start != -1) return null;
+    var factors: std.ArrayList(LinearOp) = .empty;
+    var it = effects.iterator();
+    while (it.next()) |e| {
+        if (e.key_ptr.* == 0) continue;
+        if (e.value_ptr.* == 0) continue;
+        try factors.append(alloc, .{ .offset = e.key_ptr.*, .factor = e.value_ptr.* });
+    }
+    return factors;
+}
+
+fn checkScanLoop(body: []const BfOp) ?i32 {
+    if (body.len != 1) return null;
+    return switch (body[0]) {
+        .inc_ptr => |v| if (v == 1) @as(i32, 1) else if (v == -1) @as(i32, -1) else null,
+        else => null,
+    };
+}
+
+fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
+    var contracted: std.ArrayList(BfOp) = .empty;
+    defer contracted.deinit(alloc);
+    var i: usize = 0;
+    while (i < initial.len) {
+        const op = initial[i];
+        switch (op) {
+            .inc_ptr => |v| {
+                var total = v;
+                var j = i + 1;
+                while (j < initial.len and initial[j] == .inc_ptr) : (j += 1) total += initial[j].inc_ptr;
+                if (total != 0) try contracted.append(alloc, .{ .inc_ptr = total });
+                i = j;
+            },
+            .add_val => |v| {
+                var total = v;
+                var j = i + 1;
+                while (j < initial.len and initial[j] == .add_val) : (j += 1) total += initial[j].add_val;
+                if (total != 0) try contracted.append(alloc, .{ .add_val = total });
+                i = j;
+            },
+            else => {
+                try contracted.append(alloc, op);
+                i += 1;
+            },
+        }
+    }
+
+    var out: std.ArrayList(BfOp) = .empty;
+    errdefer {
+        freeOps(out.items);
+        out.deinit(alloc);
+    }
+    const ops = contracted.items;
+    i = 0;
+    while (i < ops.len) {
+        const op = ops[i];
+        if (op == .loop_start) {
+            var depth: i32 = 1;
+            var j = i + 1;
+            var possible_linear = true;
+            while (j < ops.len) : (j += 1) {
+                if (ops[j] == .loop_start) {
+                    depth += 1;
+                    possible_linear = false;
+                } else if (ops[j] == .loop_end) {
+                    depth -= 1;
+                }
+                if (depth == 0) break;
+            }
+            if (depth == 0) {
+                const body = ops[i + 1 .. j];
+                if (body.len == 1 and body[0] == .add_val) {
+                    const v = body[0].add_val;
+                    if (v == 1 or v == -1) {
+                        try out.append(alloc, .set_zero);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                if (checkScanLoop(body)) |dir| {
+                    try out.append(alloc, if (dir == 1) .scan_right else .scan_left);
+                    i = j + 1;
+                    continue;
+                }
+                if (possible_linear) {
+                    if (try checkLinearLoop(body)) |factors| {
+                        try out.append(alloc, .{ .linear_loop = factors });
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        try out.append(alloc, op);
+        i += 1;
+    }
+    return out;
+}
+
+fn emit(s: []const u8) void {
+    output_buf.appendSlice(alloc, s) catch {};
+}
+
+fn emitFmt(comptime fmt: []const u8, args: anytype) void {
+    output_buf.print(alloc, fmt, args) catch {};
+}
+
+fn cellTypeName(cell_size: i32) []const u8 {
+    return switch (cell_size) {
+        16 => "u16",
+        32 => "u32",
+        64 => "u64",
+        else => "u8",
+    };
+}
+
+fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
+    for (ops) |op| switch (op) {
+        .inc_ptr => |v| emitFmt("__bf_p_{d} = __bf_p_{d} + ({d});\n", .{ id, id, v }),
+        .add_val => |v| {
+            if (v >= 0) {
+                emitFmt("__bf_tape_{d}[__bf_p_{d}] = __bf_tape_{d}[__bf_p_{d}] + ({d});\n", .{ id, id, id, id, v });
+            } else {
+                emitFmt("__bf_tape_{d}[__bf_p_{d}] = __bf_tape_{d}[__bf_p_{d}] - ({d});\n", .{ id, id, id, id, -v });
+            }
+        },
+        .output => emitFmt("@printf(\"%c\", __bf_tape_{d}[__bf_p_{d}]);\n", .{ id, id }),
+        .input => emitFmt("@scanf(\"%c\", &__bf_tape_{d}[__bf_p_{d}]);\n", .{ id, id }),
+        .loop_start => emitFmt("for {{ if (__bf_tape_{d}[__bf_p_{d}] == 0) {{ break; }}\n", .{ id, id }),
+        .loop_end => emit("}\n"),
+        .set_zero => emitFmt("__bf_tape_{d}[__bf_p_{d}] = 0;\n", .{ id, id }),
+        .scan_right => emitFmt("for {{ if (__bf_tape_{d}[__bf_p_{d}] == 0) {{ break; }} __bf_p_{d} = __bf_p_{d} + 1; }}\n", .{ id, id, id, id }),
+        .scan_left => emitFmt("for {{ if (__bf_tape_{d}[__bf_p_{d}] == 0) {{ break; }} __bf_p_{d} = __bf_p_{d} - 1; }}\n", .{ id, id, id, id }),
+        .linear_loop => |factors| {
+            emitFmt("if (__bf_tape_{d}[__bf_p_{d}] != 0) {{\n", .{ id, id });
+            for (factors.items) |f| {
+                if (f.factor == 1) {
+                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] + __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, id, id });
+                } else if (f.factor == -1) {
+                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] - __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, id, id });
+                } else if (f.factor > 0) {
+                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] + ({d} as {s}) * __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, f.factor, cell_t, id, id });
+                } else {
+                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] - ({d} as {s}) * __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, -f.factor, cell_t, id, id });
+                }
+            }
+            emitFmt("__bf_tape_{d}[__bf_p_{d}] = 0;\n", .{ id, id });
+            emit("}\n");
+        },
+    };
 }
 
 fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutput) callconv(.c) c_int {
     _ = host;
-    const code = input.raw_source[0..input.raw_source_len];
-    translate(code);
+    output_buf.clearRetainingCapacity();
+
+    const raw = input.raw_source[0..input.raw_source_len];
+    var ctx = parseConfig(raw) catch return 1;
+    defer ctx.deinit();
+
+    var ops = parseOps(ctx.code.items) catch return 1;
+    defer ops.deinit(alloc);
+    var opt = optimize(ops.items) catch return 1;
+    defer {
+        freeOps(opt.items);
+        opt.deinit(alloc);
+    }
+
+    const cell_t = cellTypeName(ctx.cell_size);
+    const id = block_counter;
+    block_counter += 1;
+
+    emitFmt("arr<{s}, {d}> __bf_tape_{d};\n", .{ cell_t, ctx.len, id });
+    emitFmt("for i32 __bf_i_{d} = 0; __bf_i_{d} < {d}; __bf_i_{d}++ {{ __bf_tape_{d}[__bf_i_{d}] = 0; }}\n", .{ id, id, ctx.len, id, id, id });
+    emitFmt("i32 __bf_p_{d} = 0;\n", .{id});
+
+    for (ctx.loads.items) |l| {
+        emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
+    }
+
+    emitOps(opt.items, cell_t, id);
+
+    for (ctx.loads.items) |l| {
+        emitFmt("{s} = __bf_tape_{d}[{d}] as i32;\n", .{ l.var_name, id, l.pos });
+    }
+
     output.* = .{
         .generated_zlang_source = output_buf.items.ptr,
         .generated_zlang_source_len = @intCast(output_buf.items.len),
