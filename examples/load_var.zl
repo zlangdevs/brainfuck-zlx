@@ -1,0 +1,16 @@
+?? Demonstrates ?load? directive: copy a zlang variable into the
+?? brainfuck tape, mutate it inside the block, copy back.
+fun main() >> i32 {
+    i32 x = 65;
+    @printf("Before BF: x = %d (char: %c)\n", x, x);
+
+    brainfuck {
+        ?len 10?
+        ?load x 0?
+        ?? Add 1 to cell 0 (where x lives) and print it.
+        +.
+    };
+
+    @printf("\nAfter BF:  x = %d (char: %c)\n", x, x);
+    return 0;
+}
