@@ -67,6 +67,90 @@ fn parseTypeBits(spec: []const u8) struct { bits: i32, signed: bool } {
     return .{ .bits = bits, .signed = signed };
 }
 
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn matchTypeAt(src: []const u8, idx: usize) ?struct { bits: i32, signed: bool, end: usize } {
+    if (idx >= src.len) return null;
+    const first = src[idx];
+    if (first != 'i' and first != 'u') return null;
+    var k = idx + 1;
+    var has_digit = false;
+    while (k < src.len and std.ascii.isDigit(src[k])) : (k += 1) has_digit = true;
+    if (!has_digit) return null;
+    if (k < src.len and isIdentChar(src[k])) return null;
+    const bits = std.fmt.parseInt(i32, src[idx + 1 .. k], 10) catch return null;
+    if (bits != 8 and bits != 16 and bits != 32 and bits != 64) return null;
+    return .{ .bits = bits, .signed = first == 'i', .end = k };
+}
+
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fread(ptr: [*]u8, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn fclose(f: *anyopaque) c_int;
+extern "c" fn fseek(f: *anyopaque, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(f: *anyopaque) c_long;
+
+const InferredType = struct { bits: i32, signed: bool };
+fn inferVarType(file_path: []const u8, line_limit: u32, var_name: []const u8) ?InferredType {
+    const path_z = alloc.dupeZ(u8, file_path) catch return null;
+    defer alloc.free(path_z);
+    const f = fopen(path_z.ptr, "rb") orelse return null;
+    defer _ = fclose(f);
+    if (fseek(f, 0, 2) != 0) return null;
+    const sz_long = ftell(f);
+    if (sz_long < 0 or sz_long > 16 * 1024 * 1024) return null;
+    if (fseek(f, 0, 0) != 0) return null;
+    const sz: usize = @intCast(sz_long);
+    const src = alloc.alloc(u8, sz) catch return null;
+    defer alloc.free(src);
+    const got = fread(src.ptr, 1, sz, f);
+    if (got != sz) return null;
+
+    var found: ?InferredType = null;
+    var line: u32 = 1;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == '\n') {
+            line += 1;
+            if (line > line_limit) break;
+            continue;
+        }
+        if (!isIdentChar(src[i])) continue;
+        if (i > 0 and isIdentChar(src[i - 1])) {
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            i -= 1;
+            continue;
+        }
+        var end = i;
+        while (end < src.len and isIdentChar(src[end])) : (end += 1) {}
+        const tok = src[i..end];
+        if (std.mem.eql(u8, tok, var_name)) {
+            var j = end;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+            if (j < src.len and src[j] == ':') {
+                j += 1;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+                if (matchTypeAt(src, j)) |m| {
+                    found = .{ .bits = m.bits, .signed = m.signed };
+                }
+            } else if (i >= 1) {
+                var p = i;
+                while (p > 0 and (src[p - 1] == ' ' or src[p - 1] == '\t')) : (p -= 1) {}
+                if (p > 0 and isIdentChar(src[p - 1])) {
+                    var ts = p;
+                    while (ts > 0 and isIdentChar(src[ts - 1])) : (ts -= 1) {}
+                    if (matchTypeAt(src, ts)) |m| {
+                        if (m.end == p) found = .{ .bits = m.bits, .signed = m.signed };
+                    }
+                }
+            }
+        }
+        i = end - 1;
+    }
+    return found;
+}
+
 const BfCtx = struct {
     cell_size: i32 = 8,
     len: i32 = 100,
@@ -428,6 +512,15 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
     const raw = input.raw_source[0..input.raw_source_len];
     var ctx = parseConfig(raw) catch return 1;
     defer ctx.deinit();
+
+    const file_path_slice = std.mem.span(input.file);
+    for (ctx.loads.items) |*l| {
+        if (l.typed) continue;
+        const inferred = inferVarType(file_path_slice, input.line, l.var_name) orelse continue;
+        l.bits = inferred.bits;
+        l.signed = inferred.signed;
+        l.typed = true;
+    }
 
     var ops = parseOps(ctx.code.items) catch return 1;
     defer ops.deinit(alloc);
