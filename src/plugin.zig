@@ -207,6 +207,20 @@ fn checkScanLoop(body: []const BfOp) ?i32 {
     };
 }
 
+fn skipDeadLoop(ops: []const BfOp, start: usize) ?usize {
+    if (ops[start] != .loop_start) return null;
+    var depth: i32 = 1;
+    var j = start + 1;
+    while (j < ops.len) : (j += 1) {
+        if (ops[j] == .loop_start) depth += 1
+        else if (ops[j] == .loop_end) {
+            depth -= 1;
+            if (depth == 0) return j + 1;
+        }
+    }
+    return null;
+}
+
 fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
     var contracted: std.ArrayList(BfOp) = .empty;
     defer contracted.deinit(alloc);
@@ -241,9 +255,16 @@ fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
         out.deinit(alloc);
     }
     const ops = contracted.items;
+    var cell_known_zero = true;
     i = 0;
     while (i < ops.len) {
         const op = ops[i];
+        if (op == .loop_start and cell_known_zero) {
+            if (skipDeadLoop(ops, i)) |after| {
+                i = after;
+                continue;
+            }
+        }
         if (op == .loop_start) {
             var depth: i32 = 1;
             var j = i + 1;
@@ -263,18 +284,21 @@ fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
                     const v = body[0].add_val;
                     if (v == 1 or v == -1) {
                         try out.append(alloc, .set_zero);
+                        cell_known_zero = true;
                         i = j + 1;
                         continue;
                     }
                 }
                 if (checkScanLoop(body)) |dir| {
                     try out.append(alloc, if (dir == 1) .scan_right else .scan_left);
+                    cell_known_zero = true;
                     i = j + 1;
                     continue;
                 }
                 if (possible_linear) {
                     if (try checkLinearLoop(body)) |factors| {
                         try out.append(alloc, .{ .linear_loop = factors });
+                        cell_known_zero = true;
                         i = j + 1;
                         continue;
                     }
@@ -282,6 +306,11 @@ fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
             }
         }
         try out.append(alloc, op);
+        cell_known_zero = switch (op) {
+            .set_zero, .linear_loop, .loop_end => true,
+            .input => false,
+            .add_val, .inc_ptr, .output, .scan_right, .scan_left, .loop_start => false,
+        };
         i += 1;
     }
     return out;
@@ -304,40 +333,89 @@ fn cellTypeName(cell_size: i32) []const u8 {
     };
 }
 
+fn flushOffset(off: *i32, id: u32) void {
+    if (off.* == 0) return;
+    if (off.* > 0) {
+        emitFmt("__bf_p_{d} = __bf_p_{d} + ({d});\n", .{ id, id, off.* });
+    } else {
+        emitFmt("__bf_p_{d} = __bf_p_{d} - ({d});\n", .{ id, id, -off.* });
+    }
+    off.* = 0;
+}
+
+fn emitAt(off: i32, id: u32, suffix: []const u8) void {
+    if (off == 0) {
+        emitFmt("__bf_tape_{d}[__bf_p_{d}]", .{ id, id });
+    } else if (off > 0) {
+        emitFmt("__bf_tape_{d}[__bf_p_{d} + {d}]", .{ id, id, off });
+    } else {
+        emitFmt("__bf_tape_{d}[__bf_p_{d} - {d}]", .{ id, id, -off });
+    }
+    emit(suffix);
+}
+
 fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
+    var off: i32 = 0;
     for (ops) |op| switch (op) {
-        .inc_ptr => |v| emitFmt("__bf_p_{d} = __bf_p_{d} + ({d});\n", .{ id, id, v }),
+        .inc_ptr => |v| off += v,
         .add_val => |v| {
-            if (v >= 0) {
-                emitFmt("__bf_tape_{d}[__bf_p_{d}] = __bf_tape_{d}[__bf_p_{d}] + ({d});\n", .{ id, id, id, id, v });
-            } else {
-                emitFmt("__bf_tape_{d}[__bf_p_{d}] = __bf_tape_{d}[__bf_p_{d}] - ({d});\n", .{ id, id, id, id, -v });
-            }
+            emitAt(off, id, " = ");
+            emitAt(off, id, "");
+            if (v >= 0) emitFmt(" + ({d});\n", .{v}) else emitFmt(" - ({d});\n", .{-v});
         },
-        .output => emitFmt("@printf(\"%c\", __bf_tape_{d}[__bf_p_{d}]);\n", .{ id, id }),
-        .input => emitFmt("@scanf(\"%c\", &__bf_tape_{d}[__bf_p_{d}]);\n", .{ id, id }),
-        .loop_start => emitFmt("for {{ if (__bf_tape_{d}[__bf_p_{d}] == 0) {{ break; }}\n", .{ id, id }),
-        .loop_end => emit("}\n"),
-        .set_zero => emitFmt("__bf_tape_{d}[__bf_p_{d}] = 0;\n", .{ id, id }),
-        .scan_right => emitFmt("for {{ if (__bf_tape_{d}[__bf_p_{d}] == 0) {{ break; }} __bf_p_{d} = __bf_p_{d} + 1; }}\n", .{ id, id, id, id }),
-        .scan_left => emitFmt("for {{ if (__bf_tape_{d}[__bf_p_{d}] == 0) {{ break; }} __bf_p_{d} = __bf_p_{d} - 1; }}\n", .{ id, id, id, id }),
+        .set_zero => {
+            emitAt(off, id, " = 0;\n");
+        },
+        .output => {
+            emit("@printf(\"%c\", ");
+            emitAt(off, id, ");\n");
+        },
+        .input => {
+            emit("@scanf(\"%c\", &");
+            emitAt(off, id, ");\n");
+        },
+        .loop_start => {
+            flushOffset(&off, id);
+            emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{\n", .{ id, id });
+        },
+        .loop_end => {
+            flushOffset(&off, id);
+            emit("}\n");
+        },
+        .scan_right => {
+            flushOffset(&off, id);
+            emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} + 1; }}\n", .{ id, id, id, id });
+        },
+        .scan_left => {
+            flushOffset(&off, id);
+            emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} - 1; }}\n", .{ id, id, id, id });
+        },
         .linear_loop => |factors| {
-            emitFmt("if (__bf_tape_{d}[__bf_p_{d}] != 0) {{\n", .{ id, id });
+            emit("if (");
+            emitAt(off, id, " != 0) {\n");
             for (factors.items) |f| {
+                const target_off = off + f.offset;
+                emitAt(target_off, id, " = ");
+                emitAt(target_off, id, "");
                 if (f.factor == 1) {
-                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] + __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, id, id });
+                    emit(" + ");
+                    emitAt(off, id, ";\n");
                 } else if (f.factor == -1) {
-                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] - __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, id, id });
+                    emit(" - ");
+                    emitAt(off, id, ";\n");
                 } else if (f.factor > 0) {
-                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] + ({d} as {s}) * __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, f.factor, cell_t, id, id });
+                    emitFmt(" + ({d} as {s}) * ", .{ f.factor, cell_t });
+                    emitAt(off, id, ";\n");
                 } else {
-                    emitFmt("__bf_tape_{d}[__bf_p_{d} + ({d})] = __bf_tape_{d}[__bf_p_{d} + ({d})] - ({d} as {s}) * __bf_tape_{d}[__bf_p_{d}];\n", .{ id, id, f.offset, id, id, f.offset, -f.factor, cell_t, id, id });
+                    emitFmt(" - ({d} as {s}) * ", .{ -f.factor, cell_t });
+                    emitAt(off, id, ";\n");
                 }
             }
-            emitFmt("__bf_tape_{d}[__bf_p_{d}] = 0;\n", .{ id, id });
+            emitAt(off, id, " = 0;\n");
             emit("}\n");
         },
     };
+    flushOffset(&off, id);
 }
 
 fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutput) callconv(.c) c_int {
