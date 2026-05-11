@@ -54,7 +54,17 @@ var block_counter: u32 = 0;
 const LoadRequest = struct {
     var_name: []u8,
     pos: i32,
+    bits: i32,
+    signed: bool,
 };
+
+fn parseTypeBits(spec: []const u8) struct { bits: i32, signed: bool } {
+    if (spec.len < 2) return .{ .bits = 32, .signed = true };
+    const signed = spec[0] == 'i';
+    if (spec[0] != 'i' and spec[0] != 'u') return .{ .bits = 32, .signed = true };
+    const bits = std.fmt.parseInt(i32, spec[1..], 10) catch 32;
+    return .{ .bits = bits, .signed = signed };
+}
 
 const BfCtx = struct {
     cell_size: i32 = 8,
@@ -93,11 +103,21 @@ fn parseConfig(input: []const u8) !BfCtx {
                     ctx.len = std.fmt.parseInt(i32, value, 10) catch ctx.len;
                 } else if (std.mem.eql(u8, name, "load")) {
                     var parts = std.mem.splitScalar(u8, value, ' ');
-                    const var_name = parts.next() orelse continue;
+                    const raw_name = parts.next() orelse continue;
                     const pos_str = parts.next() orelse continue;
                     const pos = std.fmt.parseInt(i32, std.mem.trim(u8, pos_str, " \t"), 10) catch continue;
-                    const name_dup = try alloc.dupe(u8, std.mem.trim(u8, var_name, " \t"));
-                    try ctx.loads.append(alloc, .{ .var_name = name_dup, .pos = pos });
+                    const trimmed = std.mem.trim(u8, raw_name, " \t");
+                    var bits: i32 = 32;
+                    var signed_flag: bool = true;
+                    var var_only = trimmed;
+                    if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+                        var_only = trimmed[0..colon];
+                        const t = parseTypeBits(trimmed[colon + 1 ..]);
+                        bits = t.bits;
+                        signed_flag = t.signed;
+                    }
+                    const name_dup = try alloc.dupe(u8, var_only);
+                    try ctx.loads.append(alloc, .{ .var_name = name_dup, .pos = pos, .bits = bits, .signed = signed_flag });
                 }
             }
             continue;
@@ -344,33 +364,36 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
     emitFmt("for i32 __bf_i_{d} = 0; __bf_i_{d} < {d}; __bf_i_{d}++ {{ __bf_tape_{d}[__bf_i_{d}] = 0; }}\n", .{ id, id, ctx.len, id, id, id });
     emitFmt("i32 __bf_p_{d} = 0;\n", .{id});
 
-    const var_bits: i32 = 32;
     const cs: i32 = ctx.cell_size;
-    const cells_per_var: i32 = @max(1, @divTrunc(var_bits + cs - 1, cs));
 
     for (ctx.loads.items) |l| {
-        if (cells_per_var == 1) {
+        const var_t = if (l.signed) "i" else "u";
+        const cells: i32 = @max(1, @divTrunc(l.bits + cs - 1, cs));
+        if (cells == 1) {
             emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
         } else {
             var k: i32 = 0;
-            while (k < cells_per_var) : (k += 1) {
-                const shift = cs * (cells_per_var - 1 - k);
+            while (k < cells) : (k += 1) {
+                const shift = cs * (cells - 1 - k);
                 emitFmt("__bf_tape_{d}[{d}] = (({s} >> {d}) as {s});\n", .{ id, l.pos + k, l.var_name, shift, cell_t });
             }
         }
+        _ = var_t;
     }
 
     emitOps(opt.items, cell_t, id);
 
     for (ctx.loads.items) |l| {
-        if (cells_per_var == 1) {
-            emitFmt("{s} = __bf_tape_{d}[{d}] as i32;\n", .{ l.var_name, id, l.pos });
+        const var_t_str = if (l.signed) "i" else "u";
+        const cells: i32 = @max(1, @divTrunc(l.bits + cs - 1, cs));
+        if (cells == 1) {
+            emitFmt("{s} = __bf_tape_{d}[{d}] as {s}{d};\n", .{ l.var_name, id, l.pos, var_t_str, l.bits });
         } else {
             emitFmt("{s} = 0;\n", .{l.var_name});
             var k: i32 = 0;
-            while (k < cells_per_var) : (k += 1) {
-                const shift = cs * (cells_per_var - 1 - k);
-                emitFmt("{s} = {s} | ((__bf_tape_{d}[{d}] as i32) << {d});\n", .{ l.var_name, l.var_name, id, l.pos + k, shift });
+            while (k < cells) : (k += 1) {
+                const shift = cs * (cells - 1 - k);
+                emitFmt("{s} = {s} | ((__bf_tape_{d}[{d}] as {s}{d}) << {d});\n", .{ l.var_name, l.var_name, id, l.pos + k, var_t_str, l.bits, shift });
             }
         }
     }
