@@ -56,6 +56,7 @@ const LoadRequest = struct {
     pos: i32,
     bits: i32,
     signed: bool,
+    typed: bool,
 };
 
 fn parseTypeBits(spec: []const u8) struct { bits: i32, signed: bool } {
@@ -109,15 +110,17 @@ fn parseConfig(input: []const u8) !BfCtx {
                     const trimmed = std.mem.trim(u8, raw_name, " \t");
                     var bits: i32 = 32;
                     var signed_flag: bool = true;
+                    var typed_flag: bool = false;
                     var var_only = trimmed;
                     if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
                         var_only = trimmed[0..colon];
                         const t = parseTypeBits(trimmed[colon + 1 ..]);
                         bits = t.bits;
                         signed_flag = t.signed;
+                        typed_flag = true;
                     }
                     const name_dup = try alloc.dupe(u8, var_only);
-                    try ctx.loads.append(alloc, .{ .var_name = name_dup, .pos = pos, .bits = bits, .signed = signed_flag });
+                    try ctx.loads.append(alloc, .{ .var_name = name_dup, .pos = pos, .bits = bits, .signed = signed_flag, .typed = typed_flag });
                 }
             }
             continue;
@@ -221,7 +224,7 @@ fn skipDeadLoop(ops: []const BfOp, start: usize) ?usize {
     return null;
 }
 
-fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
+fn optimize(initial: []const BfOp, initial_cell_zero: bool) !std.ArrayList(BfOp) {
     var contracted: std.ArrayList(BfOp) = .empty;
     defer contracted.deinit(alloc);
     var i: usize = 0;
@@ -255,7 +258,7 @@ fn optimize(initial: []const BfOp) !std.ArrayList(BfOp) {
         out.deinit(alloc);
     }
     const ops = contracted.items;
-    var cell_known_zero = true;
+    var cell_known_zero = initial_cell_zero;
     i = 0;
     while (i < ops.len) {
         const op = ops[i];
@@ -428,7 +431,8 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
 
     var ops = parseOps(ctx.code.items) catch return 1;
     defer ops.deinit(alloc);
-    var opt = optimize(ops.items) catch return 1;
+    const initial_zero = ctx.loads.items.len == 0;
+    var opt = optimize(ops.items, initial_zero) catch return 1;
     defer {
         freeOps(opt.items);
         opt.deinit(alloc);
@@ -445,7 +449,10 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
     const cs: i32 = ctx.cell_size;
 
     for (ctx.loads.items) |l| {
-        const var_t = if (l.signed) "i" else "u";
+        if (!l.typed) {
+            emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
+            continue;
+        }
         const cells: i32 = @max(1, @divTrunc(l.bits + cs - 1, cs));
         if (cells == 1) {
             emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
@@ -456,12 +463,15 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
                 emitFmt("__bf_tape_{d}[{d}] = (({s} >> {d}) as {s});\n", .{ id, l.pos + k, l.var_name, shift, cell_t });
             }
         }
-        _ = var_t;
     }
 
     emitOps(opt.items, cell_t, id);
 
     for (ctx.loads.items) |l| {
+        if (!l.typed) {
+            emitFmt("{s} = __bf_tape_{d}[{d}];\n", .{ l.var_name, id, l.pos });
+            continue;
+        }
         const var_t_str = if (l.signed) "i" else "u";
         const cells: i32 = @max(1, @divTrunc(l.bits + cs - 1, cs));
         if (cells == 1) {
