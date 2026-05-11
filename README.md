@@ -8,13 +8,15 @@ ZLang extension that adds `brainfuck { ... }` blocks to `.zl` source.
 ./build.sh
 ```
 
-Produces `brainfuck.so` next to `brainfuck.zlx`. The `.so` is the
-required install-time sidecar (same stem as the `.zlx`).
+Compiles `src/plugin.zig` into `brainfuck.so`, then packs
+`manifest.zon` + `brainfuck.so` into a single-file archive
+`brainfuck.zlx`. Both intermediates are gitignored; only sources
+(`manifest.zon`, `src/`, `examples/`, `build.sh`) are committed.
 
 ## Install
 
 ```sh
-zlang install ./brainfuck.zlx
+zlang module install ./brainfuck.zlx
 ```
 
 ## Use
@@ -22,16 +24,33 @@ zlang install ./brainfuck.zlx
 ```zl
 fun main() >> i32 {
     brainfuck {
+        ?len 30000?
         ++++++++[>++++++++<-]>+.
     }
     return 0;
 }
 ```
 
-The plugin's syntax-block handler translates the raw Brainfuck source
-into inline ZLang statements operating on a 30000-cell `u8` tape.
+Inside the block:
+- `?len N?` — tape length.
+- `?cell_size N?` — cell width in bits (8, 16, 32, 64).
+- `?load name pos?` — copy a zlang `i32` variable into the tape at
+  `pos`, write back on exit. Use `?load name:type pos?` to specify
+  any iN / uN type (split big-endian across cells if it doesn't fit).
+- `?? ...` — comment until end of line.
 
-## Status
+Standalone `.b` / `.bf` files compile with `zlang -bN file.bf`
+(N = 8, 16, 32, 64) once the extension is installed.
 
-First cut. Supports `+ - > < . [ ]`. `,` and cell-width selection
-(`-b8`/`-b16`/`-b32`/`-b64`) are TODO. Targets `linux-x86_64`.
+## Optimizations
+
+Done at codegen time (compile fragment is plain `.zl` so LLVM
+optimizes the rest):
+- Run-length contraction of `+ -` and `> <`.
+- `[+]` / `[-]` → set cell to 0.
+- `[<]` / `[>]` → scan loop.
+- Linear loops like `[->++<]` → direct multiply-and-zero.
+- Pointer-offset accumulation across non-IO ops.
+- Dead-loop elimination after known-zero cells.
+
+See `examples/` for hello world, variable load, and a calculator.

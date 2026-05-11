@@ -1,5 +1,6 @@
 brainfuck.so
 brainfuck.so.o
+brainfuck.zlx
 *.o
 .zig-cache/
 zig-out/
