@@ -74,6 +74,11 @@ fn parseConfig(input: []const u8) !BfCtx {
     errdefer ctx.deinit();
     var i: usize = 0;
     while (i < input.len) {
+        if (i + 1 < input.len and input[i] == '?' and input[i + 1] == '?') {
+            const nl = std.mem.indexOfScalarPos(u8, input, i, '\n') orelse input.len;
+            i = nl;
+            continue;
+        }
         if (input[i] == '?') {
             const close = std.mem.indexOfScalarPos(u8, input, i + 1, '?') orelse break;
             const inner = std.mem.trim(u8, input[i + 1 .. close], " \t");
@@ -339,14 +344,35 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
     emitFmt("for i32 __bf_i_{d} = 0; __bf_i_{d} < {d}; __bf_i_{d}++ {{ __bf_tape_{d}[__bf_i_{d}] = 0; }}\n", .{ id, id, ctx.len, id, id, id });
     emitFmt("i32 __bf_p_{d} = 0;\n", .{id});
 
+    const var_bits: i32 = 32;
+    const cs: i32 = ctx.cell_size;
+    const cells_per_var: i32 = @max(1, @divTrunc(var_bits + cs - 1, cs));
+
     for (ctx.loads.items) |l| {
-        emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
+        if (cells_per_var == 1) {
+            emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
+        } else {
+            var k: i32 = 0;
+            while (k < cells_per_var) : (k += 1) {
+                const shift = cs * (cells_per_var - 1 - k);
+                emitFmt("__bf_tape_{d}[{d}] = (({s} >> {d}) as {s});\n", .{ id, l.pos + k, l.var_name, shift, cell_t });
+            }
+        }
     }
 
     emitOps(opt.items, cell_t, id);
 
     for (ctx.loads.items) |l| {
-        emitFmt("{s} = __bf_tape_{d}[{d}] as i32;\n", .{ l.var_name, id, l.pos });
+        if (cells_per_var == 1) {
+            emitFmt("{s} = __bf_tape_{d}[{d}] as i32;\n", .{ l.var_name, id, l.pos });
+        } else {
+            emitFmt("{s} = 0;\n", .{l.var_name});
+            var k: i32 = 0;
+            while (k < cells_per_var) : (k += 1) {
+                const shift = cs * (cells_per_var - 1 - k);
+                emitFmt("{s} = {s} | ((__bf_tape_{d}[{d}] as i32) << {d});\n", .{ l.var_name, l.var_name, id, l.pos + k, shift });
+            }
+        }
     }
 
     output.* = .{

@@ -1,5 +1,13 @@
 ?? Demonstrates ?load? directive: copy a zlang variable into the
 ?? brainfuck tape, mutate it inside the block, copy back.
+??
+?? With cell_size=8 (default), an i32 is split big-endian into 4
+?? cells starting at the load position. For x = 65 loaded at 0:
+??   tape[0] = 0x00 (high)
+??   tape[1] = 0x00
+??   tape[2] = 0x00
+??   tape[3] = 0x41 (low = 65 = 'A')
+?? Move the pointer to cell 3 with >>> before mutating.
 fun main() >> i32 {
     i32 x = 65;
     @printf("Before BF: x = %d (char: %c)\n", x, x);
@@ -7,8 +15,7 @@ fun main() >> i32 {
     brainfuck {
         ?len 10?
         ?load x 0?
-        ?? Add 1 to cell 0 (where x lives) and print it.
-        +.
+        >>>+.
     };
 
     @printf("\nAfter BF:  x = %d (char: %c)\n", x, x);
