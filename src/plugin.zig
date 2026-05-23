@@ -239,6 +239,7 @@ const BfOp = union(enum) {
     loop_start,
     loop_end,
     set_zero,
+    set_val: i32,
     linear_loop: std.ArrayList(LinearOp),
     scan_left,
     scan_right,
@@ -382,6 +383,13 @@ fn optimize(initial: []const BfOp, initial_cell_zero: bool) !std.ArrayList(BfOp)
                 if (body.len == 1 and body[0] == .add_val) {
                     const v = body[0].add_val;
                     if (v == 1 or v == -1) {
+                        const k = j + 1;
+                        if (k < ops.len and ops[k] == .add_val) {
+                            try out.append(alloc, .{ .set_val = ops[k].add_val });
+                            cell_known_zero = false;
+                            i = k + 1;
+                            continue;
+                        }
                         try out.append(alloc, .set_zero);
                         cell_known_zero = true;
                         i = j + 1;
@@ -407,12 +415,57 @@ fn optimize(initial: []const BfOp, initial_cell_zero: bool) !std.ArrayList(BfOp)
         try out.append(alloc, op);
         cell_known_zero = switch (op) {
             .set_zero, .linear_loop, .loop_end => true,
+            .set_val => |v| v == 0,
             .input => false,
             .add_val, .inc_ptr, .output, .scan_right, .scan_left, .loop_start => false,
         };
         i += 1;
     }
-    return out;
+
+    var peep: std.ArrayList(BfOp) = .empty;
+    errdefer {
+        freeOps(peep.items);
+        peep.deinit(alloc);
+    }
+    var pi: usize = 0;
+    while (pi < out.items.len) {
+        const cur = out.items[pi];
+        if (cur == .set_val and pi + 1 < out.items.len) {
+            const nxt = out.items[pi + 1];
+            if (nxt == .add_val) {
+                try peep.append(alloc, .{ .set_val = cur.set_val + nxt.add_val });
+                pi += 2;
+                continue;
+            }
+            if (nxt == .set_val) {
+                try peep.append(alloc, .{ .set_val = nxt.set_val });
+                pi += 2;
+                continue;
+            }
+            if (nxt == .set_zero) {
+                try peep.append(alloc, .set_zero);
+                pi += 2;
+                continue;
+            }
+        }
+        if (cur == .set_zero and pi + 1 < out.items.len) {
+            const nxt = out.items[pi + 1];
+            if (nxt == .add_val) {
+                try peep.append(alloc, .{ .set_val = nxt.add_val });
+                pi += 2;
+                continue;
+            }
+            if (nxt == .set_zero or nxt == .set_val) {
+                try peep.append(alloc, nxt);
+                pi += 2;
+                continue;
+            }
+        }
+        try peep.append(alloc, cur);
+        pi += 1;
+    }
+    out.deinit(alloc);
+    return peep;
 }
 
 fn emit(s: []const u8) void {
@@ -453,45 +506,186 @@ fn emitAt(off: i32, id: u32, suffix: []const u8) void {
     emit(suffix);
 }
 
+fn emitCell(id: u32, ptr: i32, suffix: []const u8) void {
+    emitFmt("__bf_tape_{d}[{d}]", .{ id, ptr });
+    emit(suffix);
+}
+
+fn staticPointerSafe(ops: []const BfOp, tape_len: i32) bool {
+    var loop_stack: [256]i32 = undefined;
+    var depth: usize = 0;
+    var ptr: i32 = 0;
+    var min_ptr: i32 = 0;
+    var max_ptr: i32 = 0;
+    for (ops) |op| switch (op) {
+        .inc_ptr => |v| {
+            ptr += v;
+            if (depth != 0) loop_stack[depth - 1] += v;
+            min_ptr = @min(min_ptr, ptr);
+            max_ptr = @max(max_ptr, ptr);
+        },
+        .loop_start => {
+            if (depth >= loop_stack.len) return false;
+            loop_stack[depth] = 0;
+            depth += 1;
+        },
+        .loop_end => {
+            if (depth == 0) return false;
+            depth -= 1;
+            if (loop_stack[depth] != 0) return false;
+        },
+        .scan_left, .scan_right => return false,
+        .linear_loop => |factors| {
+            for (factors.items) |f| {
+                min_ptr = @min(min_ptr, ptr + f.offset);
+                max_ptr = @max(max_ptr, ptr + f.offset);
+            }
+        },
+        else => {},
+    };
+    return depth == 0 and min_ptr >= 0 and max_ptr < tape_len;
+}
+
+fn emitOpsStatic(ops: []const BfOp, cell_t: []const u8, id: u32) void {
+    var ptr: i32 = 0;
+    for (ops) |op| switch (op) {
+        .inc_ptr => |v| ptr += v,
+        .add_val => |v| {
+            emitCell(id, ptr, " = ");
+            emitCell(id, ptr, "");
+            if (v >= 0) emitFmt(" + ({d});\n", .{v}) else emitFmt(" - ({d});\n", .{-v});
+        },
+        .set_zero => emitCell(id, ptr, " = 0;\n"),
+        .set_val => |v| {
+            emitCell(id, ptr, " = ");
+            emitFmt("{d};\n", .{v});
+        },
+        .output => {
+            emit("@printf(\"%c\", ");
+            emitCell(id, ptr, ");\n");
+        },
+        .input => {
+            emit("@scanf(\"%c\", &");
+            emitCell(id, ptr, ");\n");
+        },
+        .loop_start => {
+            emit("for (");
+            emitCell(id, ptr, " != 0) {\n");
+        },
+        .loop_end => emit("}\n"),
+        .linear_loop => |factors| {
+            for (factors.items) |f| {
+                const target = ptr + f.offset;
+                emitCell(id, target, " = ");
+                emitCell(id, target, "");
+                if (f.factor == 1) {
+                    emit(" + ");
+                    emitCell(id, ptr, ";\n");
+                } else if (f.factor == -1) {
+                    emit(" - ");
+                    emitCell(id, ptr, ";\n");
+                } else if (f.factor > 0) {
+                    emitFmt(" + ({d} as {s}) * ", .{ f.factor, cell_t });
+                    emitCell(id, ptr, ";\n");
+                } else {
+                    emitFmt(" - ({d} as {s}) * ", .{ -f.factor, cell_t });
+                    emitCell(id, ptr, ";\n");
+                }
+            }
+            emitCell(id, ptr, " = 0;\n");
+        },
+        .scan_left, .scan_right => unreachable,
+    };
+}
+
+const EffectKind = enum { add, set };
+const Effect = struct { kind: EffectKind, value: i32 };
+
+const EffectMap = struct {
+    map: std.AutoHashMap(i32, Effect),
+
+    fn init() EffectMap {
+        return .{ .map = std.AutoHashMap(i32, Effect).init(alloc) };
+    }
+    fn deinit(self: *EffectMap) void { self.map.deinit(); }
+
+    fn applyAdd(self: *EffectMap, off: i32, v: i32) !void {
+        const entry = try self.map.getOrPut(off);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{ .kind = .add, .value = v };
+        } else {
+            entry.value_ptr.value += v;
+        }
+    }
+    fn applySet(self: *EffectMap, off: i32, v: i32) !void {
+        try self.map.put(off, .{ .kind = .set, .value = v });
+    }
+
+    fn flush(self: *EffectMap, id: u32) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            const off = e.key_ptr.*;
+            const eff = e.value_ptr.*;
+            if (eff.kind == .set) {
+                emitAt(off, id, " = ");
+                emitFmt("{d};\n", .{eff.value});
+            } else if (eff.value != 0) {
+                emitAt(off, id, " = ");
+                emitAt(off, id, "");
+                if (eff.value > 0) emitFmt(" + ({d});\n", .{eff.value}) else emitFmt(" - ({d});\n", .{-eff.value});
+            }
+        }
+        self.map.clearRetainingCapacity();
+    }
+};
+
 fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
     var off: i32 = 0;
+    var fx = EffectMap.init();
+    defer fx.deinit();
     for (ops) |op| switch (op) {
         .inc_ptr => |v| off += v,
         .add_val => |v| {
-            emitAt(off, id, " = ");
-            emitAt(off, id, "");
-            if (v >= 0) emitFmt(" + ({d});\n", .{v}) else emitFmt(" - ({d});\n", .{-v});
+            fx.applyAdd(off, v) catch {};
         },
         .set_zero => {
-            emitAt(off, id, " = 0;\n");
+            fx.applySet(off, 0) catch {};
+        },
+        .set_val => |v| {
+            fx.applySet(off, v) catch {};
         },
         .output => {
+            fx.flush(id);
             emit("@printf(\"%c\", ");
             emitAt(off, id, ");\n");
         },
         .input => {
+            fx.flush(id);
             emit("@scanf(\"%c\", &");
             emitAt(off, id, ");\n");
         },
         .loop_start => {
+            fx.flush(id);
             flushOffset(&off, id);
             emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{\n", .{ id, id });
         },
         .loop_end => {
+            fx.flush(id);
             flushOffset(&off, id);
             emit("}\n");
         },
         .scan_right => {
+            fx.flush(id);
             flushOffset(&off, id);
             emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} + 1; }}\n", .{ id, id, id, id });
         },
         .scan_left => {
+            fx.flush(id);
             flushOffset(&off, id);
             emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} - 1; }}\n", .{ id, id, id, id });
         },
         .linear_loop => |factors| {
-            emit("if (");
-            emitAt(off, id, " != 0) {\n");
+            fx.flush(id);
             for (factors.items) |f| {
                 const target_off = off + f.offset;
                 emitAt(target_off, id, " = ");
@@ -511,9 +705,9 @@ fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
                 }
             }
             emitAt(off, id, " = 0;\n");
-            emit("}\n");
         },
     };
+    fx.flush(id);
     flushOffset(&off, id);
 }
 
@@ -549,7 +743,8 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
 
     emitFmt("arr<{s}, {d}> __bf_tape_{d};\n", .{ cell_t, ctx.len, id });
     emitFmt("for i32 __bf_i_{d} = 0; __bf_i_{d} < {d}; __bf_i_{d}++ {{ __bf_tape_{d}[__bf_i_{d}] = 0; }}\n", .{ id, id, ctx.len, id, id, id });
-    emitFmt("i32 __bf_p_{d} = 0;\n", .{id});
+    const use_static_pointer = staticPointerSafe(opt.items, ctx.len);
+    if (!use_static_pointer) emitFmt("i32 __bf_p_{d} = 0;\n", .{id});
 
     const cs: i32 = ctx.cell_size;
 
@@ -570,7 +765,7 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
         }
     }
 
-    emitOps(opt.items, cell_t, id);
+    if (use_static_pointer) emitOpsStatic(opt.items, cell_t, id) else emitOps(opt.items, cell_t, id);
 
     for (ctx.loads.items) |l| {
         if (!l.typed) {
