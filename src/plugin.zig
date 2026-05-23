@@ -551,9 +551,8 @@ fn emitOpsStatic(ops: []const BfOp, cell_t: []const u8, id: u32) void {
     for (ops) |op| switch (op) {
         .inc_ptr => |v| ptr += v,
         .add_val => |v| {
-            emitCell(id, ptr, " = ");
-            emitCell(id, ptr, "");
-            if (v >= 0) emitFmt(" + ({d});\n", .{v}) else emitFmt(" - ({d});\n", .{-v});
+            if (v > 0) { emitCell(id, ptr, " += "); emitFmt("{d};\n", .{v}); }
+            else if (v < 0) { emitCell(id, ptr, " -= "); emitFmt("{d};\n", .{-v}); }
         },
         .set_zero => emitCell(id, ptr, " = 0;\n"),
         .set_val => |v| {
@@ -629,10 +628,12 @@ const EffectMap = struct {
             if (eff.kind == .set) {
                 emitAt(off, id, " = ");
                 emitFmt("{d};\n", .{eff.value});
-            } else if (eff.value != 0) {
-                emitAt(off, id, " = ");
-                emitAt(off, id, "");
-                if (eff.value > 0) emitFmt(" + ({d});\n", .{eff.value}) else emitFmt(" - ({d});\n", .{-eff.value});
+            } else if (eff.value > 0) {
+                emitAt(off, id, " += ");
+                emitFmt("{d};\n", .{eff.value});
+            } else if (eff.value < 0) {
+                emitAt(off, id, " -= ");
+                emitFmt("{d};\n", .{-eff.value});
             }
         }
         self.map.clearRetainingCapacity();
@@ -685,26 +686,41 @@ fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
             emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} - 1; }}\n", .{ id, id, id, id });
         },
         .linear_loop => |factors| {
+            const known = fx.map.get(off);
+            const counter_const: ?i32 = if (known) |k| (if (k.kind == .set) k.value else null) else null;
             fx.flush(id);
-            for (factors.items) |f| {
-                const target_off = off + f.offset;
-                emitAt(target_off, id, " = ");
-                emitAt(target_off, id, "");
-                if (f.factor == 1) {
-                    emit(" + ");
-                    emitAt(off, id, ";\n");
-                } else if (f.factor == -1) {
-                    emit(" - ");
-                    emitAt(off, id, ";\n");
-                } else if (f.factor > 0) {
-                    emitFmt(" + ({d} as {s}) * ", .{ f.factor, cell_t });
-                    emitAt(off, id, ";\n");
-                } else {
-                    emitFmt(" - ({d} as {s}) * ", .{ -f.factor, cell_t });
-                    emitAt(off, id, ";\n");
+            if (counter_const) |k| {
+                if (k != 0) {
+                    for (factors.items) |f| {
+                        const target_off = off + f.offset;
+                        const total = f.factor * k;
+                        if (total == 0) continue;
+                        if (total > 0) { emitAt(target_off, id, " += "); emitFmt("{d};\n", .{total}); }
+                        else { emitAt(target_off, id, " -= "); emitFmt("{d};\n", .{-total}); }
+                    }
                 }
+                emitAt(off, id, " = 0;\n");
+            } else {
+                for (factors.items) |f| {
+                    const target_off = off + f.offset;
+                    if (f.factor == 1) {
+                        emitAt(target_off, id, " += ");
+                        emitAt(off, id, ";\n");
+                    } else if (f.factor == -1) {
+                        emitAt(target_off, id, " -= ");
+                        emitAt(off, id, ";\n");
+                    } else if (f.factor > 0) {
+                        emitAt(target_off, id, " += ");
+                        emitFmt("({d} as {s}) * ", .{ f.factor, cell_t });
+                        emitAt(off, id, ";\n");
+                    } else {
+                        emitAt(target_off, id, " -= ");
+                        emitFmt("({d} as {s}) * ", .{ -f.factor, cell_t });
+                        emitAt(off, id, ";\n");
+                    }
+                }
+                emitAt(off, id, " = 0;\n");
             }
-            emitAt(off, id, " = 0;\n");
         },
     };
     fx.flush(id);
