@@ -10,7 +10,19 @@ const HostApi = extern struct {
     diagnostic: *const fn (host: *HostApi, level: c_int, file: ?[*:0]const u8, line: u32, column: u32, message: [*:0]const u8, hint: ?[*:0]const u8) callconv(.c) void,
     resolve_type_size: *const fn (host: *HostApi, file: [*:0]const u8, type_name: [*:0]const u8) callconv(.c) i32,
     get_cli_flag: *const fn (host: *HostApi, name: [*:0]const u8) callconv(.c) ?[*:0]const u8,
+    register_file_extension: *const fn (host: *HostApi, extension: [*:0]const u8, handler: FileExtensionHandler) callconv(.c) c_int,
 };
+
+const FileExtensionRequest = extern struct {
+    input_path: [*:0]const u8,
+    output_path: ?[*:0]const u8,
+    want_continue: c_int,
+};
+const FileExtensionResult = extern struct {
+    continue_path: ?[*:0]const u8,
+    llvm_ir_path: ?[*:0]const u8,
+};
+const FileExtensionHandler = *const fn (host: *HostApi, req: *const FileExtensionRequest, res: *FileExtensionResult) callconv(.c) c_int;
 
 const BlockSyntax = extern struct { mode: c_int, terminator: ?[*:0]const u8 };
 const BlockInput = extern struct { file: [*:0]const u8, line: u32, column: u32, raw_source: [*]const u8, raw_source_len: u32 };
@@ -43,17 +55,17 @@ const PluginDesc = extern struct {
 
 var probe_singleton: ProbeResult = .{
     .api_min = 1,
-    .api_max = 3,
+    .api_max = 5,
     .name = "brainfuck",
-    .version = "0.2.0",
+    .version = "0.3.0",
     .requires_host_features = null,
 };
 
 var desc_singleton: PluginDesc = .{
     .api_min = 1,
-    .api_max = 3,
+    .api_max = 5,
     .name = "brainfuck",
-    .version = "0.2.0",
+    .version = "0.3.0",
     .register_plugin = registerPlugin,
     .session_begin = sessionBegin,
     .session_end = null,
@@ -812,6 +824,554 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
     return 0;
 }
 
+// ============================================================================
+// Direct LLVM IR backend. Emits a complete .ll file for a standalone .b/.bf
+// program. clang -O3 -x ir handles the rest of the pipeline downstream.
+// ============================================================================
+
+const LLEmit = struct {
+    buf: *std.ArrayList(u8),
+    next_id: u32 = 0,
+    next_lbl: u32 = 0,
+    loops: std.ArrayList([2]u32) = .empty,
+    cs_bits: i32,
+
+    fn fresh(self: *LLEmit) u32 { self.next_id += 1; return self.next_id; }
+    fn freshLbl(self: *LLEmit) u32 { self.next_lbl += 1; return self.next_lbl; }
+    fn w(self: *LLEmit, s: []const u8) void { self.buf.appendSlice(alloc, s) catch {}; }
+    fn wf(self: *LLEmit, comptime fmt: []const u8, args: anytype) void { self.buf.print(alloc, fmt, args) catch {}; }
+
+    fn cellTy(self: *LLEmit) []const u8 {
+        return switch (self.cs_bits) {
+            16 => "i16",
+            32 => "i32",
+            64 => "i64",
+            else => "i8",
+        };
+    }
+};
+
+// === EffectMap-batched LLVM IR emit ==========================================
+//
+// Track within an extended basic block:
+//   - pbase_id: SSA id holding the current %P value (loaded once per block)
+//   - off: i32 accumulated ptr delta since pbase_id was loaded
+//   - effects: pending add/set at offsets relative to pbase_id
+// Flush at boundaries (loop_start, loop_end, scan, output, input, end).
+
+const LLEffectKind = enum { add, set };
+const LLEffect = struct { kind: LLEffectKind, value: i64 };
+
+const LLBlockState = struct {
+    pbase_id: ?u32 = null,        // i32 SSA id of current %P value
+    pbase_addr: ?u32 = null,      // ptr SSA id: cell address at pbase + 0
+    off: i32 = 0,
+    effects: std.AutoHashMap(i32, LLEffect),
+
+    fn init() LLBlockState {
+        return .{ .effects = std.AutoHashMap(i32, LLEffect).init(alloc) };
+    }
+    fn deinit(self: *LLBlockState) void { self.effects.deinit(); }
+    fn clear(self: *LLBlockState) void {
+        self.pbase_id = null;
+        self.pbase_addr = null;
+        self.off = 0;
+        self.effects.clearRetainingCapacity();
+    }
+    fn applyAdd(self: *LLBlockState, off: i32, v: i64) !void {
+        const entry = try self.effects.getOrPut(off);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .kind = .add, .value = v }
+        else entry.value_ptr.value += v;
+    }
+    fn applySet(self: *LLBlockState, off: i32, v: i64) !void {
+        try self.effects.put(off, .{ .kind = .set, .value = v });
+    }
+};
+
+// Ensure %pbase (i32) is loaded; return its SSA id.
+fn ensurePbase(e: *LLEmit, st: *LLBlockState) u32 {
+    if (st.pbase_id) |id| return id;
+    const id = e.fresh();
+    e.wf("  %v{d} = load i32, ptr %P, align 4\n", .{id});
+    st.pbase_id = id;
+    return id;
+}
+
+// Ensure the base cell address (pbase+0 as ptr) is materialized; return its id.
+fn ensurePbaseAddr(e: *LLEmit, st: *LLBlockState) u32 {
+    if (st.pbase_addr) |id| return id;
+    const p = ensurePbase(e, st);
+    const sext_id = e.fresh();
+    e.wf("  %v{d} = sext i32 %v{d} to i64\n", .{ sext_id, p });
+    const addr_id = e.fresh();
+    e.wf("  %v{d} = getelementptr inbounds {s}, ptr %T, i64 %v{d}\n", .{ addr_id, e.cellTy(), sext_id });
+    st.pbase_addr = addr_id;
+    return addr_id;
+}
+
+// Compute cell address at (pbase + rel) using a single constant-offset GEP from cached base.
+fn emitCellAddrRel(e: *LLEmit, st: *LLBlockState, rel: i32) u32 {
+    const base = ensurePbaseAddr(e, st);
+    if (rel == 0) return base;
+    const addr_id = e.fresh();
+    e.wf("  %v{d} = getelementptr inbounds {s}, ptr %v{d}, i64 {d}\n", .{ addr_id, e.cellTy(), base, rel });
+    return addr_id;
+}
+
+fn flushEffects(e: *LLEmit, st: *LLBlockState) void {
+    const cell_t = e.cellTy();
+    var it = st.effects.iterator();
+    while (it.next()) |kv| {
+        const off = kv.key_ptr.*;
+        const eff = kv.value_ptr.*;
+        if (eff.kind == .set) {
+            const a = emitCellAddrRel(e, st, off);
+            e.wf("  store {s} {d}, ptr %v{d}, align 1\n", .{ cell_t, eff.value, a });
+        } else {
+            if (eff.value == 0) continue;
+            const a = emitCellAddrRel(e, st, off);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            const r = e.fresh();
+            e.wf("  %v{d} = add {s} %v{d}, {d}\n", .{ r, cell_t, c, eff.value });
+            e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, r, a });
+        }
+    }
+    st.effects.clearRetainingCapacity();
+}
+
+// Flush effects + writeback ptr offset, ending the current extended block.
+// After this, pbase_id is invalidated (next access reloads).
+fn endBlock(e: *LLEmit, st: *LLBlockState) void {
+    flushEffects(e, st);
+    if (st.off != 0) {
+        const pbase = ensurePbase(e, st);
+        const np = e.fresh();
+        e.wf("  %v{d} = add nsw i32 %v{d}, {d}\n", .{ np, pbase, st.off });
+        e.wf("  store i32 %v{d}, ptr %P, align 4\n", .{np});
+    }
+    st.clear();
+}
+
+fn emitOpsLL(e: *LLEmit, ops: []const BfOp) !void {
+    const cell_t = e.cellTy();
+    var st = LLBlockState.init();
+    defer st.deinit();
+
+    for (ops) |op| switch (op) {
+        .inc_ptr => |v| {
+            st.off += v;
+        },
+        .add_val => |v| {
+            try st.applyAdd(st.off, v);
+        },
+        .set_zero => {
+            try st.applySet(st.off, 0);
+        },
+        .set_val => |v| {
+            try st.applySet(st.off, v);
+        },
+        .output => {
+            // Flush only the current cell first so the load sees up-to-date value.
+            const at = st.off;
+            if (st.effects.get(at)) |eff| {
+                _ = st.effects.remove(at);
+                const a = emitCellAddrRel(e, &st, at);
+                if (eff.kind == .set) {
+                    e.wf("  store {s} {d}, ptr %v{d}, align 1\n", .{ cell_t, eff.value, a });
+                } else if (eff.value != 0) {
+                    const c0 = e.fresh();
+                    e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c0, cell_t, a });
+                    const r = e.fresh();
+                    e.wf("  %v{d} = add {s} %v{d}, {d}\n", .{ r, cell_t, c0, eff.value });
+                    e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, r, a });
+                }
+            }
+            const a = emitCellAddrRel(e, &st, at);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            var arg_id = c;
+            if (e.cs_bits < 32) {
+                const z = e.fresh();
+                e.wf("  %v{d} = zext {s} %v{d} to i32\n", .{ z, cell_t, c });
+                arg_id = z;
+            } else if (e.cs_bits > 32) {
+                const t = e.fresh();
+                e.wf("  %v{d} = trunc {s} %v{d} to i32\n", .{ t, cell_t, c });
+                arg_id = t;
+            }
+            const dummy = e.fresh();
+            e.wf("  %v{d} = call i32 @putchar(i32 %v{d})\n", .{ dummy, arg_id });
+        },
+        .input => {
+            // Pending effect at current cell is overwritten by input — drop it.
+            _ = st.effects.remove(st.off);
+            const r = e.fresh();
+            e.wf("  %v{d} = call i32 @getchar()\n", .{r});
+            var val_id = r;
+            if (e.cs_bits < 32) {
+                const t = e.fresh();
+                e.wf("  %v{d} = trunc i32 %v{d} to {s}\n", .{ t, r, cell_t });
+                val_id = t;
+            } else if (e.cs_bits > 32) {
+                const s = e.fresh();
+                e.wf("  %v{d} = sext i32 %v{d} to {s}\n", .{ s, r, cell_t });
+                val_id = s;
+            }
+            const a = emitCellAddrRel(e, &st, st.off);
+            e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, val_id, a });
+        },
+        .loop_start => {
+            endBlock(e, &st);
+            const lbl = e.freshLbl();
+            try e.loops.append(alloc, .{ lbl, 0 });
+            e.wf("  br label %lc{d}\nlc{d}:\n", .{ lbl, lbl });
+            const a = emitCellAddrRel(e, &st, 0);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            const cmp = e.fresh();
+            e.wf("  %v{d} = icmp ne {s} %v{d}, 0\n", .{ cmp, cell_t, c });
+            e.wf("  br i1 %v{d}, label %lb{d}, label %le{d}\nlb{d}:\n", .{ cmp, lbl, lbl, lbl });
+            // Body of loop is a new extended block. Reload pbase fresh.
+            st.clear();
+        },
+        .loop_end => {
+            endBlock(e, &st);
+            if (e.loops.items.len == 0) continue;
+            const top = e.loops.pop() orelse continue;
+            const lbl = top[0];
+            e.wf("  br label %lc{d}\nle{d}:\n", .{ lbl, lbl });
+            st.clear();
+        },
+        .scan_right, .scan_left => {
+            endBlock(e, &st);
+            const dir: i32 = switch (op) { .scan_right => 1, .scan_left => -1, else => unreachable };
+            const lbl = e.freshLbl();
+            e.wf("  br label %sc{d}\nsc{d}:\n", .{ lbl, lbl });
+            const a = emitCellAddrRel(e, &st, 0);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            const cmp = e.fresh();
+            e.wf("  %v{d} = icmp ne {s} %v{d}, 0\n", .{ cmp, cell_t, c });
+            e.wf("  br i1 %v{d}, label %sb{d}, label %se{d}\nsb{d}:\n", .{ cmp, lbl, lbl, lbl });
+            const p = e.fresh();
+            e.wf("  %v{d} = load i32, ptr %P, align 4\n", .{p});
+            const np = e.fresh();
+            if (dir == 1) e.wf("  %v{d} = add nsw i32 %v{d}, 1\n", .{ np, p })
+            else e.wf("  %v{d} = sub nsw i32 %v{d}, 1\n", .{ np, p });
+            e.wf("  store i32 %v{d}, ptr %P, align 4\n", .{np});
+            e.wf("  br label %sc{d}\nse{d}:\n", .{ lbl, lbl });
+            st.clear();
+        },
+        .linear_loop => |factors| {
+            // Const-prop: if current cell has a pending set, we know the counter value.
+            const known = st.effects.get(st.off);
+            const counter_const: ?i64 = if (known) |k| (if (k.kind == .set) k.value else null) else null;
+            if (counter_const != null) _ = st.effects.remove(st.off);
+
+            if (counter_const) |k| {
+                if (k != 0) {
+                    for (factors.items) |f| {
+                        const target_off = st.off + f.offset;
+                        const total: i64 = @as(i64, @intCast(f.factor)) * k;
+                        if (total != 0) try st.applyAdd(target_off, total);
+                    }
+                }
+                try st.applySet(st.off, 0);
+            } else {
+                // Flush all pending effects so loads see committed memory.
+                flushEffects(e, &st);
+                const ca = emitCellAddrRel(e, &st, st.off);
+                const cv = e.fresh();
+                e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ cv, cell_t, ca });
+                for (factors.items) |f| {
+                    const ta = emitCellAddrRel(e, &st, st.off + f.offset);
+                    const tcur = e.fresh();
+                    e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ tcur, cell_t, ta });
+                    const contrib = e.fresh();
+                    if (f.factor == 1) {
+                        e.wf("  %v{d} = add {s} %v{d}, %v{d}\n", .{ contrib, cell_t, tcur, cv });
+                    } else if (f.factor == -1) {
+                        e.wf("  %v{d} = sub {s} %v{d}, %v{d}\n", .{ contrib, cell_t, tcur, cv });
+                    } else {
+                        const m = e.fresh();
+                        e.wf("  %v{d} = mul {s} %v{d}, {d}\n", .{ m, cell_t, cv, f.factor });
+                        e.wf("  %v{d} = add {s} %v{d}, %v{d}\n", .{ contrib, cell_t, tcur, m });
+                    }
+                    e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, contrib, ta });
+                }
+                e.wf("  store {s} 0, ptr %v{d}, align 1\n", .{ cell_t, ca });
+            }
+        },
+    };
+
+    endBlock(e, &st);
+}
+
+// ---- Static-pointer LLVM IR emit (when staticPointerSafe(...) ----
+// No %P at all. Tape via `getelementptr inbounds [N x iCS], ptr %T, i64 0, i64 const`.
+
+const LLStaticState = struct {
+    ptr: i32 = 0,
+    // Effect map keyed by absolute tape index.
+    effects: std.AutoHashMap(i32, LLEffect),
+
+    fn init() LLStaticState { return .{ .effects = std.AutoHashMap(i32, LLEffect).init(alloc) }; }
+    fn deinit(self: *LLStaticState) void { self.effects.deinit(); }
+    fn applyAdd(self: *LLStaticState, idx: i32, v: i64) !void {
+        const ent = try self.effects.getOrPut(idx);
+        if (!ent.found_existing) ent.value_ptr.* = .{ .kind = .add, .value = v }
+        else ent.value_ptr.value += v;
+    }
+    fn applySet(self: *LLStaticState, idx: i32, v: i64) !void {
+        try self.effects.put(idx, .{ .kind = .set, .value = v });
+    }
+};
+
+fn emitStaticCellAddr(e: *LLEmit, tape_len: i32, idx: i32) u32 {
+    const id = e.fresh();
+    e.wf("  %v{d} = getelementptr inbounds [{d} x {s}], ptr %T, i64 0, i64 {d}\n", .{ id, tape_len, e.cellTy(), idx });
+    return id;
+}
+
+fn flushStaticEffects(e: *LLEmit, tape_len: i32, st: *LLStaticState) void {
+    const cell_t = e.cellTy();
+    var it = st.effects.iterator();
+    while (it.next()) |kv| {
+        const idx = kv.key_ptr.*;
+        const eff = kv.value_ptr.*;
+        if (eff.kind == .set) {
+            const a = emitStaticCellAddr(e, tape_len, idx);
+            e.wf("  store {s} {d}, ptr %v{d}, align 1\n", .{ cell_t, eff.value, a });
+        } else {
+            if (eff.value == 0) continue;
+            const a = emitStaticCellAddr(e, tape_len, idx);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            const r = e.fresh();
+            e.wf("  %v{d} = add {s} %v{d}, {d}\n", .{ r, cell_t, c, eff.value });
+            e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, r, a });
+        }
+    }
+    st.effects.clearRetainingCapacity();
+}
+
+fn emitOpsStaticLL(e: *LLEmit, ops: []const BfOp, tape_len: i32) !void {
+    const cell_t = e.cellTy();
+    var st = LLStaticState.init();
+    defer st.deinit();
+
+    for (ops) |op| switch (op) {
+        .inc_ptr => |v| { st.ptr += v; },
+        .add_val => |v| { try st.applyAdd(st.ptr, v); },
+        .set_zero => { try st.applySet(st.ptr, 0); },
+        .set_val => |v| { try st.applySet(st.ptr, v); },
+        .output => {
+            const idx = st.ptr;
+            if (st.effects.get(idx)) |eff| {
+                _ = st.effects.remove(idx);
+                const a = emitStaticCellAddr(e, tape_len, idx);
+                if (eff.kind == .set) {
+                    e.wf("  store {s} {d}, ptr %v{d}, align 1\n", .{ cell_t, eff.value, a });
+                } else if (eff.value != 0) {
+                    const c0 = e.fresh();
+                    e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c0, cell_t, a });
+                    const r = e.fresh();
+                    e.wf("  %v{d} = add {s} %v{d}, {d}\n", .{ r, cell_t, c0, eff.value });
+                    e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, r, a });
+                }
+            }
+            const a = emitStaticCellAddr(e, tape_len, idx);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            var arg_id = c;
+            if (e.cs_bits < 32) {
+                const z = e.fresh();
+                e.wf("  %v{d} = zext {s} %v{d} to i32\n", .{ z, cell_t, c });
+                arg_id = z;
+            } else if (e.cs_bits > 32) {
+                const t = e.fresh();
+                e.wf("  %v{d} = trunc {s} %v{d} to i32\n", .{ t, cell_t, c });
+                arg_id = t;
+            }
+            const dummy = e.fresh();
+            e.wf("  %v{d} = call i32 @putchar(i32 %v{d})\n", .{ dummy, arg_id });
+        },
+        .input => {
+            _ = st.effects.remove(st.ptr);
+            const r = e.fresh();
+            e.wf("  %v{d} = call i32 @getchar()\n", .{r});
+            var val_id = r;
+            if (e.cs_bits < 32) {
+                const t = e.fresh();
+                e.wf("  %v{d} = trunc i32 %v{d} to {s}\n", .{ t, r, cell_t });
+                val_id = t;
+            } else if (e.cs_bits > 32) {
+                const s = e.fresh();
+                e.wf("  %v{d} = sext i32 %v{d} to {s}\n", .{ s, r, cell_t });
+                val_id = s;
+            }
+            const a = emitStaticCellAddr(e, tape_len, st.ptr);
+            e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, val_id, a });
+        },
+        .loop_start => {
+            // Loop guards: flush pending effects, then check counter cell.
+            flushStaticEffects(e, tape_len, &st);
+            const lbl = e.freshLbl();
+            try e.loops.append(alloc, .{ lbl, 0 });
+            e.wf("  br label %lc{d}\nlc{d}:\n", .{ lbl, lbl });
+            const a = emitStaticCellAddr(e, tape_len, st.ptr);
+            const c = e.fresh();
+            e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ c, cell_t, a });
+            const cmp = e.fresh();
+            e.wf("  %v{d} = icmp ne {s} %v{d}, 0\n", .{ cmp, cell_t, c });
+            e.wf("  br i1 %v{d}, label %lb{d}, label %le{d}\nlb{d}:\n", .{ cmp, lbl, lbl, lbl });
+        },
+        .loop_end => {
+            flushStaticEffects(e, tape_len, &st);
+            if (e.loops.items.len == 0) continue;
+            const top = e.loops.pop() orelse continue;
+            const lbl = top[0];
+            e.wf("  br label %lc{d}\nle{d}:\n", .{ lbl, lbl });
+        },
+        .scan_left, .scan_right => unreachable, // staticPointerSafe excludes scans
+        .linear_loop => |factors| {
+            const known = st.effects.get(st.ptr);
+            const counter_const: ?i64 = if (known) |k| (if (k.kind == .set) k.value else null) else null;
+            if (counter_const != null) _ = st.effects.remove(st.ptr);
+
+            if (counter_const) |k| {
+                if (k != 0) {
+                    for (factors.items) |f| {
+                        const target = st.ptr + f.offset;
+                        const total: i64 = @as(i64, @intCast(f.factor)) * k;
+                        if (total != 0) try st.applyAdd(target, total);
+                    }
+                }
+                try st.applySet(st.ptr, 0);
+            } else {
+                flushStaticEffects(e, tape_len, &st);
+                const ca = emitStaticCellAddr(e, tape_len, st.ptr);
+                const cv = e.fresh();
+                e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ cv, cell_t, ca });
+                for (factors.items) |f| {
+                    const ta = emitStaticCellAddr(e, tape_len, st.ptr + f.offset);
+                    const tcur = e.fresh();
+                    e.wf("  %v{d} = load {s}, ptr %v{d}, align 1\n", .{ tcur, cell_t, ta });
+                    const contrib = e.fresh();
+                    if (f.factor == 1) {
+                        e.wf("  %v{d} = add {s} %v{d}, %v{d}\n", .{ contrib, cell_t, tcur, cv });
+                    } else if (f.factor == -1) {
+                        e.wf("  %v{d} = sub {s} %v{d}, %v{d}\n", .{ contrib, cell_t, tcur, cv });
+                    } else {
+                        const m = e.fresh();
+                        e.wf("  %v{d} = mul {s} %v{d}, {d}\n", .{ m, cell_t, cv, f.factor });
+                        e.wf("  %v{d} = add {s} %v{d}, %v{d}\n", .{ contrib, cell_t, tcur, m });
+                    }
+                    e.wf("  store {s} %v{d}, ptr %v{d}, align 1\n", .{ cell_t, contrib, ta });
+                }
+                e.wf("  store {s} 0, ptr %v{d}, align 1\n", .{ cell_t, ca });
+            }
+        },
+    };
+
+    flushStaticEffects(e, tape_len, &st);
+}
+
+fn emitProgramLL(ops: []const BfOp, cell_bits: i32, tape_len: i32, out: *std.ArrayList(u8)) !void {
+    const bytes_per_cell: i64 = @divTrunc(cell_bits, 8);
+    out.print(alloc,
+        \\target triple = "x86_64-unknown-linux-gnu"
+        \\declare i32 @putchar(i32)
+        \\declare i32 @getchar()
+        \\declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)
+        \\
+        \\define i32 @main() {{
+        \\entry:
+        \\  %T = alloca [{d} x i{d}], align 16
+        \\  %P = alloca i32, align 4
+        \\  store i32 0, ptr %P, align 4
+        \\  call void @llvm.memset.p0.i64(ptr align 16 %T, i8 0, i64 {d}, i1 false)
+        \\
+    , .{ tape_len, cell_bits, @as(i64, tape_len) * bytes_per_cell }) catch {};
+
+    var e = LLEmit{ .buf = out, .cs_bits = cell_bits };
+    defer e.loops.deinit(alloc);
+    if (staticPointerSafe(ops, tape_len)) {
+        try emitOpsStaticLL(&e, ops, tape_len);
+    } else {
+        try emitOpsLL(&e, ops);
+    }
+
+    out.appendSlice(alloc, "  ret i32 0\n}\n") catch {};
+}
+
+extern "c" fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn getpid() c_int;
+
+var ll_path_buf: [4096:0]u8 = [_:0]u8{0} ** 4096;
+
+fn detectCellBitsFromHost(host: *HostApi) i32 {
+    if (host.get_cli_flag(host, "-b8") != null) return 8;
+    if (host.get_cli_flag(host, "-b16") != null) return 16;
+    if (host.get_cli_flag(host, "-b32") != null) return 32;
+    if (host.get_cli_flag(host, "-b64") != null) return 64;
+    return 8;
+}
+
+fn bfFileExtensionHandler(host: *HostApi, req: *const FileExtensionRequest, res: *FileExtensionResult) callconv(.c) c_int {
+    const in_path = std.mem.span(req.input_path);
+    const f = fopen(req.input_path, "rb") orelse return 1;
+    defer _ = fclose(f);
+    if (fseek(f, 0, 2) != 0) return 1;
+    const n_long = ftell(f);
+    if (n_long < 0 or n_long > 64 * 1024 * 1024) return 1;
+    if (fseek(f, 0, 0) != 0) return 1;
+    const n: usize = @intCast(n_long);
+    const src = alloc.alloc(u8, n) catch return 1;
+    defer alloc.free(src);
+    const got = fread(src.ptr, 1, n, f);
+    if (got != n) return 1;
+
+    // Reuse the existing config parser: synthesize "?cell_size N? ?len 30000?" prefix
+    const cell_bits = detectCellBitsFromHost(host);
+    var wrapped: std.ArrayList(u8) = .empty;
+    defer wrapped.deinit(alloc);
+    wrapped.print(alloc, "?cell_size {d}? ?len 30000?\n", .{cell_bits}) catch return 1;
+    wrapped.appendSlice(alloc, src) catch return 1;
+
+    var ctx = parseConfig(wrapped.items) catch return 1;
+    defer ctx.deinit();
+
+    var ops = parseOps(ctx.code.items) catch return 1;
+    defer ops.deinit(alloc);
+    var opt = optimize(ops.items, true) catch return 1;
+    defer {
+        freeOps(opt.items);
+        opt.deinit(alloc);
+    }
+
+    var ll: std.ArrayList(u8) = .empty;
+    defer ll.deinit(alloc);
+    emitProgramLL(opt.items, ctx.cell_size, ctx.len, &ll) catch return 1;
+
+    // Write to /tmp/zlx-bf-<pid>-<basename>.ll
+    var base_start: usize = 0;
+    var ii: usize = 0;
+    while (ii < in_path.len) : (ii += 1) if (in_path[ii] == '/') { base_start = ii + 1; };
+    const base = in_path[base_start..];
+
+    const pid = getpid();
+    const path = std.fmt.bufPrintZ(&ll_path_buf, "/tmp/zlx-bf-{d}-{s}.ll", .{ pid, base }) catch return 1;
+
+    const out = fopen(path.ptr, "wb") orelse return 1;
+    _ = fwrite(ll.items.ptr, 1, ll.items.len, out);
+    _ = fclose(out);
+
+    res.* = .{ .continue_path = null, .llvm_ir_path = path.ptr };
+    return 0;
+}
+
 fn sessionBegin(host: *HostApi) callconv(.c) void {
     _ = host;
     block_counter = 0;
@@ -826,6 +1386,10 @@ fn registerPlugin(host: *HostApi) callconv(.c) c_int {
     _ = host.register_cli_flag(host, "-b16", "Compile Brainfuck (16-bit cells)", 0);
     _ = host.register_cli_flag(host, "-b32", "Compile Brainfuck (32-bit cells)", 0);
     _ = host.register_cli_flag(host, "-b64", "Compile Brainfuck (64-bit cells)", 0);
+    if (host.api_version >= 5) {
+        _ = host.register_file_extension(host, ".b", bfFileExtensionHandler);
+        _ = host.register_file_extension(host, ".bf", bfFileExtensionHandler);
+    }
     return 0;
 }
 
