@@ -27,9 +27,11 @@ run_bench() {
     r_end=$(date +%s%N)
     rms=$(( (r_end - r_start) / 1000000 ))
     bs=$(stat -c %s "$bin")
-    printf "%-12s  bf=%-10s  bin=%-8s  compile=%5dms  run=%5dms\n" "$name" "$bytes" "$bs" "$cms" "$rms"
+    printf "%-15s  bf=%-10s  bin=%-8s  compile=%5dms  run=%5dms\n" "$name" "$bytes" "$bs" "$cms" "$rms"
 }
 
 echo "=== bf.zlx benchmark $(date +%H:%M:%S) ==="
 run_bench mandelbrot ../zlang/thirdparties/mandelbrot.bf 32
-run_bench sieve100 $ZLB_DIR/examples/bench_sieve.zlb 64
+run_bench sieve100   $ZLB_DIR/examples/bench_sieve.zlb 64
+run_bench loops      $ZLB_DIR/examples/bench_loops.zlb 64
+run_bench fib        $ZLB_DIR/examples/bench_fib.zlb 64

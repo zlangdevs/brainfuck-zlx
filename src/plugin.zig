@@ -488,26 +488,26 @@ fn cellTypeName(cell_size: i32) []const u8 {
 fn flushOffset(off: *i32, id: u32) void {
     if (off.* == 0) return;
     if (off.* > 0) {
-        emitFmt("__bf_p_{d} = __bf_p_{d} + ({d});\n", .{ id, id, off.* });
+        emitFmt("P{d} = P{d} + ({d});\n", .{ id, id, off.* });
     } else {
-        emitFmt("__bf_p_{d} = __bf_p_{d} - ({d});\n", .{ id, id, -off.* });
+        emitFmt("P{d} = P{d} - ({d});\n", .{ id, id, -off.* });
     }
     off.* = 0;
 }
 
 fn emitAt(off: i32, id: u32, suffix: []const u8) void {
     if (off == 0) {
-        emitFmt("__bf_tape_{d}[__bf_p_{d}]", .{ id, id });
+        emitFmt("T{d}[P{d}]", .{ id, id });
     } else if (off > 0) {
-        emitFmt("__bf_tape_{d}[__bf_p_{d} + {d}]", .{ id, id, off });
+        emitFmt("T{d}[P{d} + {d}]", .{ id, id, off });
     } else {
-        emitFmt("__bf_tape_{d}[__bf_p_{d} - {d}]", .{ id, id, -off });
+        emitFmt("T{d}[P{d} - {d}]", .{ id, id, -off });
     }
     emit(suffix);
 }
 
 fn emitCell(id: u32, ptr: i32, suffix: []const u8) void {
-    emitFmt("__bf_tape_{d}[{d}]", .{ id, ptr });
+    emitFmt("T{d}[{d}]", .{ id, ptr });
     emit(suffix);
 }
 
@@ -668,7 +668,7 @@ fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
         .loop_start => {
             fx.flush(id);
             flushOffset(&off, id);
-            emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{\n", .{ id, id });
+            emitFmt("for (T{d}[P{d}] != 0) {{\n", .{ id, id });
         },
         .loop_end => {
             fx.flush(id);
@@ -678,16 +678,17 @@ fn emitOps(ops: []const BfOp, cell_t: []const u8, id: u32) void {
         .scan_right => {
             fx.flush(id);
             flushOffset(&off, id);
-            emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} + 1; }}\n", .{ id, id, id, id });
+            emitFmt("for (T{d}[P{d}] != 0) {{ P{d} = P{d} + 1; }}\n", .{ id, id, id, id });
         },
         .scan_left => {
             fx.flush(id);
             flushOffset(&off, id);
-            emitFmt("for (__bf_tape_{d}[__bf_p_{d}] != 0) {{ __bf_p_{d} = __bf_p_{d} - 1; }}\n", .{ id, id, id, id });
+            emitFmt("for (T{d}[P{d}] != 0) {{ P{d} = P{d} - 1; }}\n", .{ id, id, id, id });
         },
         .linear_loop => |factors| {
             const known = fx.map.get(off);
             const counter_const: ?i32 = if (known) |k| (if (k.kind == .set) k.value else null) else null;
+            if (counter_const != null) _ = fx.map.remove(off);
             fx.flush(id);
             if (counter_const) |k| {
                 if (k != 0) {
@@ -757,26 +758,26 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
     const id = block_counter;
     block_counter += 1;
 
-    emitFmt("arr<{s}, {d}> __bf_tape_{d};\n", .{ cell_t, ctx.len, id });
-    emitFmt("for i32 __bf_i_{d} = 0; __bf_i_{d} < {d}; __bf_i_{d}++ {{ __bf_tape_{d}[__bf_i_{d}] = 0; }}\n", .{ id, id, ctx.len, id, id, id });
+    emitFmt("arr<{s}, {d}> T{d};\n", .{ cell_t, ctx.len, id });
+    emitFmt("for i32 I{d} = 0; I{d} < {d}; I{d}++ {{ T{d}[I{d}] = 0; }}\n", .{ id, id, ctx.len, id, id, id });
     const use_static_pointer = staticPointerSafe(opt.items, ctx.len);
-    if (!use_static_pointer) emitFmt("i32 __bf_p_{d} = 0;\n", .{id});
+    if (!use_static_pointer) emitFmt("i32 P{d} = 0;\n", .{id});
 
     const cs: i32 = ctx.cell_size;
 
     for (ctx.loads.items) |l| {
         if (!l.typed) {
-            emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
+            emitFmt("T{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
             continue;
         }
         const cells: i32 = @max(1, @divTrunc(l.bits + cs - 1, cs));
         if (cells == 1) {
-            emitFmt("__bf_tape_{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
+            emitFmt("T{d}[{d}] = {s} as {s};\n", .{ id, l.pos, l.var_name, cell_t });
         } else {
             var k: i32 = 0;
             while (k < cells) : (k += 1) {
                 const shift = cs * (cells - 1 - k);
-                emitFmt("__bf_tape_{d}[{d}] = (({s} >> {d}) as {s});\n", .{ id, l.pos + k, l.var_name, shift, cell_t });
+                emitFmt("T{d}[{d}] = (({s} >> {d}) as {s});\n", .{ id, l.pos + k, l.var_name, shift, cell_t });
             }
         }
     }
@@ -785,19 +786,19 @@ fn brainfuckHandler(host: *HostApi, input: *const BlockInput, output: *BlockOutp
 
     for (ctx.loads.items) |l| {
         if (!l.typed) {
-            emitFmt("{s} = __bf_tape_{d}[{d}];\n", .{ l.var_name, id, l.pos });
+            emitFmt("{s} = T{d}[{d}];\n", .{ l.var_name, id, l.pos });
             continue;
         }
         const var_t_str = if (l.signed) "i" else "u";
         const cells: i32 = @max(1, @divTrunc(l.bits + cs - 1, cs));
         if (cells == 1) {
-            emitFmt("{s} = __bf_tape_{d}[{d}] as {s}{d};\n", .{ l.var_name, id, l.pos, var_t_str, l.bits });
+            emitFmt("{s} = T{d}[{d}] as {s}{d};\n", .{ l.var_name, id, l.pos, var_t_str, l.bits });
         } else {
             emitFmt("{s} = 0;\n", .{l.var_name});
             var k: i32 = 0;
             while (k < cells) : (k += 1) {
                 const shift = cs * (cells - 1 - k);
-                emitFmt("{s} = {s} | ((__bf_tape_{d}[{d}] as {s}{d}) << {d});\n", .{ l.var_name, l.var_name, id, l.pos + k, var_t_str, l.bits, shift });
+                emitFmt("{s} = {s} | ((T{d}[{d}] as {s}{d}) << {d});\n", .{ l.var_name, l.var_name, id, l.pos + k, var_t_str, l.bits, shift });
             }
         }
     }
